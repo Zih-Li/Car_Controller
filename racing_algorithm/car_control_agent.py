@@ -1,8 +1,3 @@
-'''
-该代码内置纯跟踪算法
-根据车辆状态选择调用路径规划和路径局部规划
-根据车辆状态和路径规划结果，计算控制指令
-'''
 import json
 import math
 import numpy as np
@@ -17,7 +12,7 @@ from racing_algorithm.generate_trajectory import GenerateTrajectory
 
 class Control:
     def __init__(self):
-        net="7Acc2JOKeN4oNsgabHrJLodPeD6V,172.19.0.1,4552,4553"
+        net="7Acc2JOKeN4oNsgabHrJLodPeD6V,172.19.0.1,5112,5113"
         v_name, ip, udp, udp_s = net.split(",")
         self.udp_client = UDPClient(ip = ip, port = int(udp), send_port = int(udp_s), vehicle_name = v_name)
 
@@ -52,25 +47,26 @@ class Control:
         self.max_speed = 12.0
         self.speed_rate = (self.max_speed - self.min_speed) / (math.pi / 6)   # Adjust speed based on curvature
         plan_params = {
-            'target_path_len': 63,
-            'lookahead_dist': 3.5,
-            'num_steer_samples': 7,
-            'cost_w_steer': 21.5,         # ↑ 保持车头方向
-            'cost_w_obs': 20,           # ↑ 远离障碍物
-            'cost_w_reverse': 100.0,    # ↑ 抑制倒车
-            'cost_w_path_deviation': 0.01, # ↑ 保持路径
-            'cost_w_steer_rate': 20,    # ↑ 保持当前转向
-            'cost_w_curvature': 13,      # ↑ 抑制大曲率
-            # 'bonus_rate_to_right': 0,     # ↑ 向右吸附奖励
+            'target_path_len': 64,
+            'lookahead_dist': 3.2,
+            'num_steer_samples': 11,
+            'cost_w_steer': 10,             # ↑ 保持车头方向
+            'cost_w_obs': 0,                # ↑ 远离障碍物
+            'cost_w_reverse': 100.0,        # ↑ 抑制倒车
+            'cost_w_path_deviation': 0.06,  # ↑ 保持路径
+            'cost_w_steer_rate': 8,         # ↑ 保持当前转向
+            'cost_w_curvature': 2,          # ↑ 抑制大曲率
+            'right_rate': 0.18,
+            'left_cost_rate': 8
         }
         self.traj_gen = GenerateTrajectory(
             map_obj=self.mapper,
-            vehicle_params={"width": 4, 'max_steer': np.pi/5},
+            vehicle_params={"width": 4, 'max_steer': np.pi/7},
             plan_params=plan_params
         )
 
-        self.last_steering_angle = 0  # For steering smoothing
-        self.steering_alpha = 0.085    # Smoothing factor (0~1, higher=less smooth)
+        self.last_steering_angle = 0
+        self.steering_alpha = 0.8
 
     def _update_map_and_vehicle_state_loop(self):
         """
@@ -201,45 +197,82 @@ class Control:
             # loop_start_time = time.time() # This was resetting the start time for frequency calculation, better to use fixed interval sleep
 
     def track_route(self, route_points, current_x, current_y, current_yaw):
-        # 优化版 Pure Pursuit 路径跟踪
         if not route_points:
-            return 0, 0
-
+            return 0, 0 
         v_point = (current_x, current_y)
-        current_speed = abs(self.m_v)
-        # 动态前视距离，速度越快前视越远
-        lookahead_distance = min(max(self.min_lookahead + current_speed * self.lookahead_ratio, self.min_lookahead), self.max_lookahead)
+        # Assuming self.m_v is the current actual speed of the vehicle.
+        # Note: In the provided class structure, self.m_v is initialized to 0 and not updated 
+        # from vehicle state. If self.m_v is always 0, lookahead_distance will be fixed to self.min_lookahead.
+        current_speed_magnitude = abs(self.m_v) 
+        lookahead_distance = min(max(self.min_lookahead + current_speed_magnitude * self.lookahead_ratio, self.min_lookahead), self.max_lookahead)
 
-        # 优化目标点选择：确保目标点在车辆前方
+        # find_target_point will return the last point of the trajectory if no suitable forward point is found.
         target_point = self.find_target_point(route_points, v_point, current_yaw, lookahead_distance)
-        if target_point is None:
+        
+        if target_point is None: # Should be covered by the initial check if route_points was empty.
             return 0, 0
 
         dx = target_point[0] - v_point[0]
         dy = target_point[1] - v_point[1]
-        target_angle = math.atan2(dy, dx)
-        alpha = target_angle - current_yaw
-        while alpha > math.pi:
-            alpha -= 2 * math.pi
-        while alpha < -math.pi:
-            alpha += 2 * math.pi
+        
         l_d = math.sqrt(dx*dx + dy*dy)
-        # 曲率控制速度：弯道减速，直道加速
-        curvature = abs(2 * math.sin(alpha) / l_d) if l_d > 0.1 else 0
-        v = max(self.min_speed,  self.max_speed - self.speed_rate * curvature)  # 速度下限6，上限12
-        # 纯跟踪公式
-        if l_d < 0.1:
-            steering_angle = 0
+
+        if l_d < 0.1: # Target is too close or coincident with current position.
+                      # Stop the car to prevent erratic behavior or division by zero.
+            return 0, 0 
+
+        target_angle = math.atan2(dy, dx)
+        
+        # alpha_for_steering is the angle from the vehicle's current heading to the target point.
+        alpha_for_steering = target_angle - current_yaw
+        # Normalize alpha_for_steering to [-pi, pi]
+        while alpha_for_steering > math.pi:
+            alpha_for_steering -= 2 * math.pi
+        while alpha_for_steering < -math.pi:
+            alpha_for_steering += 2 * math.pi
+
+        is_backing_target = False
+        # If the absolute angle to the target is greater than ~95 degrees (pi/2 + 0.1 rad),
+        # it implies the target point is generally behind the vehicle's current orientation.
+        if abs(alpha_for_steering) > (math.pi / 2 + 0.1): 
+            is_backing_target = True
+
+        # Speed calculation
+        # Curvature is based on the path's geometry relative to the car's forward axis.
+        curvature = abs(2 * math.sin(alpha_for_steering) / l_d) # l_d is confirmed > 0.1
+        
+        if is_backing_target:
+            # Define speed parameters for backing
+            backing_min_speed = self.min_speed * 0.5 # Example: half of min forward speed
+            backing_max_speed = self.min_speed       # Example: max backing speed is min forward speed
+            # Adjust speed based on curvature, similar to forward motion but with backing limits.
+            desired_speed_magnitude = max(backing_min_speed, backing_max_speed - self.speed_rate * curvature)
+            v = -desired_speed_magnitude # Speed is negative for backing
         else:
-            steering_angle = math.atan2(2 * self.L * math.sin(alpha), l_d)
-        # 转向角一阶滤波，抑制突变
+            # Forward speed
+            v = max(self.min_speed,  self.max_speed - self.speed_rate * curvature)
+
+        # Steering calculation (Pure Pursuit)
+        # The formula calculates wheel angle assuming forward motion.
+        steering_angle_raw = math.atan2(2 * self.L * math.sin(alpha_for_steering), l_d)
+
+        if is_backing_target:
+            # When backing, to make the rear of the car turn towards the target direction
+            # (indicated by alpha_for_steering), the front wheels need to steer in the opposite direction
+            # of what they would for forward motion.
+            steering_angle = -steering_angle_raw
+        else:
+            steering_angle = steering_angle_raw
+            
+        # Apply steering smoothing
         steering_angle = self.steering_alpha * steering_angle + (1 - self.steering_alpha) * self.last_steering_angle
         self.last_steering_angle = steering_angle
-        turn_angle = steering_angle
+        
+        turn_angle = steering_angle # Assuming turn_angle is the final steering command
+        
         return v, turn_angle
 
     def find_target_point(self, route_points, vehicle_pos, vehicle_yaw, lookahead_distance):
-        """优化目标点选择：确保目标点在车辆前方，且距离合适"""
         if not route_points:
             return None
         closest_idx = 0
@@ -249,19 +282,16 @@ class Control:
             if dist_sq < min_dist_sq:
                 min_dist_sq = dist_sq
                 closest_idx = i
-        # 从最近点向前，找第一个在车辆前方且距离大于lookahead的点
         for i in range(closest_idx, len(route_points)):
             px, py = route_points[i]
             dx = px - vehicle_pos[0]
             dy = py - vehicle_pos[1]
             local_x = math.cos(-vehicle_yaw) * dx - math.sin(-vehicle_yaw) * dy
-            # 只选车辆前方的点
             if local_x < 0:
                 continue
             dist = math.sqrt(dx*dx + dy*dy)
             if dist >= lookahead_distance:
                 return (px, py)
-        # 没找到则返回最后一个点
         return route_points[-1]
 
     def start(self):
