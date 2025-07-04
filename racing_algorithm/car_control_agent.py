@@ -1,5 +1,6 @@
-import json
+import json, os
 import math
+import argparse
 import numpy as np
 import time
 import threading
@@ -12,7 +13,7 @@ from racing_algorithm.generate_trajectory import GenerateTrajectory
 
 class Control:
     def __init__(self):
-        net="7Acc2JOKeN4oNsgabHrJLodPeD6V,172.19.0.1,5112,5113"
+        net="7Acc2JOKeN4oNsgabHrJLodPeD6V,172.19.0.1,1052,1053"
         v_name, ip, udp, udp_s = net.split(",")
         self.udp_client = UDPClient(ip = ip, port = int(udp), send_port = int(udp_s), vehicle_name = v_name)
 
@@ -22,9 +23,9 @@ class Control:
         self.m_yaw = 0
         self.traj = []
         self.L = 2.86 # length (meters) - adjust based on your vehicle
-        self.min_lookahead = 6 # minimum lookahead distance
-        self.max_lookahead = 12  # maximum lookahead distance
-        self.lookahead_ratio = 0.6 # lookahead = speed * ratio + min_lookahead
+        self.min_lookahead = 3 # minimum lookahead distance
+        self.max_lookahead = 9  # maximum lookahead distance
+        self.lookahead_ratio = 0.4 # lookahead = speed * ratio + min_lookahead
         self.current_steer= 0
         self.control_rate = 100 # hz
         
@@ -43,30 +44,31 @@ class Control:
         # Initialize mapper and trajectory generator
         self.mapper = map_and_obstacle(resolution_val=700, world_size_val=(160, 160))
         self.mapper.load_map_from_png(self.map_to_load)
-        self.min_speed = 6.0
+        self.min_speed = 5.0
         self.max_speed = 12.0
         self.speed_rate = (self.max_speed - self.min_speed) / (math.pi / 6)   # Adjust speed based on curvature
         plan_params = {
-            'target_path_len': 64,
-            'lookahead_dist': 3.2,
-            'num_steer_samples': 11,
-            'cost_w_steer': 10,             # ↑ 保持车头方向
-            'cost_w_obs': 0,                # ↑ 远离障碍物
+            'target_path_len': 36,
+            'lookahead_dist': 3,
+            'num_steer_samples': 9,
+            'cost_w_steer': 8,              # ↑ 保持车头方向
+            'cost_w_obs': 2,                # ↑ 远离障碍物
             'cost_w_reverse': 100.0,        # ↑ 抑制倒车
-            'cost_w_path_deviation': 0.06,  # ↑ 保持路径
+            'cost_w_path_deviation': 0.1,   # ↑ 保持路径
             'cost_w_steer_rate': 8,         # ↑ 保持当前转向
             'cost_w_curvature': 2,          # ↑ 抑制大曲率
-            'right_rate': 0.18,
-            'left_cost_rate': 8
+            'right_rate': 0.2,
+            'left_cost_rate': 16,
+            'rate_cost_dr': 0.01
         }
         self.traj_gen = GenerateTrajectory(
             map_obj=self.mapper,
-            vehicle_params={"width": 4, 'max_steer': np.pi/7},
+            vehicle_params={"width": 6, 'max_steer': np.pi/5},
             plan_params=plan_params
         )
 
         self.last_steering_angle = 0
-        self.steering_alpha = 0.8
+        self.steering_alpha = 0.95
 
     def _update_map_and_vehicle_state_loop(self):
         """
@@ -93,7 +95,7 @@ class Control:
                 'name': obj.name,
                 'x': obj.x, 'y': obj.y,
                 'yaw': obj.yaw/180*math.pi,
-                'length': 11, 'width': 4
+                'length': 10, 'width': 5
             } for obj in self.udp_client.global_data]
             
             self.mapper.update_vehicle_obstacles(vehicles)
@@ -294,25 +296,48 @@ class Control:
                 return (px, py)
         return route_points[-1]
 
-    def start(self):
+    def start(self, args):
         """Starts all the threads."""
-        self.udp_client.start() # Start UDP client communication
+        self.udp_client.start()
 
         # Start the three main operational threads
         map_update_thread = threading.Thread(target=self._update_map_and_vehicle_state_loop, daemon=True)
-        trajectory_planning_thread = threading.Thread(target=self._trajectory_planning_loop, daemon=True)
+        trajectory_planning_thread = threading.Thread(target=self._trajectory_planning_loop, daemon=True)      
         vehicle_control_thread = threading.Thread(target=self._vehicle_control_loop, daemon=True)
-
+        if not args.parse_args().mode_1:
+            trajectory_planning_thread.start()
         map_update_thread.start()
-        trajectory_planning_thread.start()
         vehicle_control_thread.start()
 
         print("All threads started.")
 
-if __name__ == '__main__':
-    control = Control()
-    control.start() # Call the method to start all threads
+    def record_traj(self):
+        traj = []
+        while True:
+            traj.append((self.m_x, self.m_y))
+            time.sleep(0.1)
+            with open("recorded_traj.json", "w") as f:
+                json.dump(traj, f)
 
+        
+if __name__ == '__main__':
+    args = argparse.ArgumentParser(description="Car Control Agent")
+    args.add_argument('--mode_1', action='store_true', help="Run with static trajectory")
+    args.add_argument('--record', action='store_true', help="Record trajectory")
+    control = Control()
+    if args.parse_args().mode_1:
+        ref_route = json.load(open("ref_route.json", "r"))
+        static_traj = []
+        x = ref_route["X"]
+        y = ref_route["Y"]
+        for xi, yi in zip(x, y):
+            static_traj.append((xi*10, yi*10))
+            print(static_traj)
+        control.traj = static_traj
+    control.start(args) # Call the method to start all threads
+    if args.parse_args().record:
+        control.record_traj()
+        print("Trajectory recording started.")
     # Keep the main thread alive to allow daemon threads to run
     try:
         while True:

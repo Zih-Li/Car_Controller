@@ -1,0 +1,11 @@
+*__pycache__*
+
+*.zip
+
+*.png
+!map.png
+
+.vscode/
+
+*.json
+!ref_route.json

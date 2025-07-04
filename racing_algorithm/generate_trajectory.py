@@ -37,7 +37,7 @@ def _get_position_from_left_right(current_x, current_y, yaw, swelled_map):
     r2x = math.cos(right_yaw); r2y = math.sin(right_yaw)
 
     rows, cols = swelled_map.shape
-    threshold = max(rows, cols) // 5
+    threshold = max(rows, cols) // 6
 
     # left
     dl = threshold
@@ -56,10 +56,12 @@ def _get_position_from_left_right(current_x, current_y, yaw, swelled_map):
         if cx < 0 or cy < 0 or cx >= cols or cy >= rows or swelled_map[cy, cx]:
             dr = i
             break
-
-    if dl + dr == 0:
-        return 0.5
-    return dr / (dl + dr)
+    di_dr = abs(threshold / 8 - dr)
+    if dl + dr == 0:       
+        return 0.5, di_dr
+    if dl + dr > threshold / 3:
+        return 0.3, di_dr
+    return dr / (dl + dr), di_dr
 
 @numba.njit(cache=True)
 def _grid_to_world_numba(col, row, sx, sy, wh):
@@ -98,13 +100,13 @@ def _bresenham_line_check_numba(r0, c0, r1, c1, swelled_map):
             err += dc; r += sr
     return False
 
-@numba.njit(cache=True)
+# @numba.njit(cache=True)
 def _process_steering_angle_numba(
     c_col, c_row, c_yaw, steer, prev_steer, forward, lookahead,
     sx, sy, wh, rows, cols, sw_map, dist_tr,
     w_steer, w_obs, w_rev, wheelbase,
     prev_traj, w_dev, w_rate, w_curv,
-    right_rate, left_rate_cost, cur_lr_rate
+    right_rate, left_rate_cost, cur_lr_rate, rate_cost_dr
 ):
     dir_f = 1.0 if forward else -1.0
     xw, yw = _grid_to_world_numba(c_col, c_row, sx, sy, wh)
@@ -130,9 +132,12 @@ def _process_steering_angle_numba(
         return False, 0,0,0.0,0.0,0.0
 
     cost_s  = w_steer * abs(steer)
-    rate    = _get_position_from_left_right(ncol, nrow, nyaw, sw_map)
-    new_lr  = 0.9*cur_lr_rate + 0.1*rate
+    tup = _get_position_from_left_right(ncol, nrow, nyaw, sw_map)
+    rate = tup[0]
+    d_r = tup[1]
+    new_lr  = 0.8*cur_lr_rate + 0.2*rate
     cost_lr = abs(new_lr - right_rate) * left_rate_cost
+    cost_dr = d_r * rate_cost_dr
     curv    = abs(steer) / wheelbase
     cost_cv = w_curv * curv
     d2o     = dist_tr[nrow, ncol]
@@ -144,7 +149,7 @@ def _process_steering_angle_numba(
         d2p = _get_min_dist_to_path_numba(nx, ny, prev_traj)
         dev_cost = w_dev * d2p
 
-    total = cost_s + cost_o + cost_r + cost_cv + cost_lr + dev_cost + w_rate * abs((steer - prev_steer)/lookahead)
+    total = cost_s + cost_o + cost_r + cost_cv + cost_lr + dev_cost + w_rate * abs((steer - prev_steer)/lookahead) + cost_dr
     return True, ncol, nrow, nyaw, total, new_lr
 
 class GenerateTrajectory:
@@ -166,6 +171,7 @@ class GenerateTrajectory:
         self.w_curv       = pp.get('cost_w_curvature',   10.0)
         self.right_rate   = pp.get('right_rate',        0.2)
         self.left_rate    = pp.get('left_cost_rate',    10.0)
+        self.rate_cost_dr = pp.get("rate_cost_dr",      2.0)
 
         # steer samples, ensure odd count
         n = pp.get('num_steer_samples', 5)
@@ -240,7 +246,7 @@ class GenerateTrajectory:
             return []
 
         # initial left/right rate
-        lr0 = _get_position_from_left_right(c0, r0, (yaw+math.pi)%(2*math.pi)-math.pi, self.s_map)
+        lr0 = _get_position_from_left_right(c0, r0, (yaw+math.pi)%(2*math.pi)-math.pi, self.s_map)[0]
         start = (c0, r0, (yaw+math.pi)%(2*math.pi)-math.pi, start_steer, lr0)
 
         pq = [(0.0, 0.0, start)]
@@ -261,11 +267,11 @@ class GenerateTrajectory:
                     sx, sy, wh, rows, cols, self.s_map, dist_tr,
                     self.w_steer, self.w_obs, self.w_rev, self.wheelbase,
                     prev, self.w_dev, self.w_rate, self.w_curv,
-                    self.right_rate, self.left_rate, clr
+                    self.right_rate, self.left_rate, cur_lr_rate=clr, rate_cost_dr=self.rate_cost_dr
                 )
                 if not ok: 
                     continue
-                new_cost = cost + ec
+                new_cost = cost + ec - lookahead
                 new_len  = plen + lookahead
                 nn = (nc, nr, ny, st, nlr)
                 if nn not in came:
@@ -300,7 +306,7 @@ class GenerateTrajectory:
             k = min(5, len(path)-1)
             spx = make_interp_spline(t, xs, k=k)
             spy = make_interp_spline(t, ys, k=k)
-            tn = np.linspace(0,1,len(path)*4)
+            tn = np.linspace(0,1,len(path)*2)
             return list(zip(spx(tn), spy(tn)))
         except Exception:
             return path
@@ -366,29 +372,30 @@ if __name__ == '__main__':
     static_map = map_handler.static_map_array
 
     vehicle_params = {
-        'width': 4.0,
+        'width': 0,
         'max_steer': np.deg2rad(30),
         'wheelbase': 2.86
     }
     plan_params = {
-        'target_path_len': 63,
-        'lookahead_dist': 3.5,
+        'target_path_len': 100,
+        'lookahead_dist': 4,
         'num_steer_samples': 9,
-        'cost_w_steer': 10,             # ↑ 保持车头方向
+        'cost_w_steer': 10.5,             # ↑ 保持车头方向
         'cost_w_obs': 0,                # ↑ 远离障碍物
         'cost_w_reverse': 100.0,        # ↑ 抑制倒车
-        'cost_w_path_deviation': 0.07,  # ↑ 保持路径
-        'cost_w_steer_rate': 8,         # ↑ 保持当前转向
-        'cost_w_curvature': 8,          # ↑ 抑制大曲率
+        'cost_w_path_deviation': 0.10,  # ↑ 保持路径
+        'cost_w_steer_rate': 11,         # ↑ 保持当前转向
+        'cost_w_curvature': 2,          # ↑ 抑制大曲率
         'right_rate': 0.18,
-        'left_cost_rate': 8
+        'left_cost_rate': 12,
+        'rate_cost_dr': 1
     }
 
     
     vehicles = [
-        {'name': 'v1', 'x': 35, 'y': 30, 'yaw': 0, 'length': 10, 'width': 5},
-        {'name': 'v2', 'x': 40, 'y': 120, 'yaw': math.pi/4, 'length': 12, 'width': 6},
-        {'name': 'v3', 'x': 130, 'y': 30, 'yaw': -math.pi/2, 'length': 15, 'width': 4}
+        # {'name': 'v1', 'x': 35, 'y': 30, 'yaw': 0, 'length': 10, 'width': 5},
+        # {'name': 'v2', 'x': 40, 'y': 120, 'yaw': math.pi/4, 'length': 12, 'width': 6},
+        # {'name': 'v3', 'x': 130, 'y': 30, 'yaw': -math.pi/2, 'length': 15, 'width': 4}
     ]
     map_handler.update_vehicle_obstacles(vehicles)
     

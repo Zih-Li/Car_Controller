@@ -10,7 +10,7 @@ map_path = "map.png"
 class map_and_obstacle:
     def __init__(self, resolution_val=1600, world_size_val=(160, 160), green_threshold_sq_val=30000):
         self.resolution = (resolution_val, resolution_val)
-        
+        self.world_size = world_size_val
         self.scale_x = self.resolution[0] / self.world_size[0] if self.world_size[0] > 0 else 1
         self.scale_y = self.resolution[1] / self.world_size[1] if self.world_size[1] > 0 else 1
 
